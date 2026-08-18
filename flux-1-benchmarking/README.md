@@ -1,6 +1,6 @@
 # FLUX.1 inference benchmarking
 
-Minimal `1024x1024` benchmarks for `FLUX.1-schnell` across BFL PyTorch, Hugging Face Diffusers, TorchAO, SGLang, vLLM Omni, TensorRT-LLM VisualGen, and TensorRT. Only optimized execution modes are retained.
+Minimal `1024x1024` benchmarks for `FLUX.1-schnell` across BFL PyTorch, Hugging Face Diffusers, TorchAO, SGLang, vLLM Omni, TensorRT-LLM VisualGen, and TensorRT. Only optimized execution modes are retained. The advanced BFL PyTorch/TensorRT sweep also supports `FLUX.1-dev` with its guided, shifted denoising schedule; the reference comparison contract remains Schnell-specific.
 
 ## Measurement
 
@@ -89,6 +89,74 @@ vllm_omni_flux_sweep.py           vLLM Omni offline batching
 ```
 
 All runners live under `benchmarks/flux1_schnell/`. Checkpoints and TensorRT plans stay outside this repository.
+
+### FLUX.1-dev with a custom TensorRT ONNX transformer
+
+The BFL/TensorRT sweep accepts `--model-name flux-schnell` (the default) or
+`--model-name flux-dev`. Model-specific defaults are applied when `--steps` or
+`--guidance` is omitted:
+
+| Model name | Steps | Guidance | Schedule shift | T5 tokens |
+|---|---:|---:|---|---:|
+| `flux-schnell` | 4 | 0.0 | disabled | 256 |
+| `flux-dev` | 50 | 3.5 | enabled | 512 |
+
+An externally quantized transformer can be combined with the unmodified CLIP, T5, and VAE ONNX
+components. Create a composed directory using links or copies:
+
+```text
+/models/FLUX.1-dev-onnx-composed/
+  clip.opt/                 -> public FLUX.1-dev ONNX clip.opt/
+  t5.opt/                   -> public FLUX.1-dev ONNX t5.opt/
+  vae.opt/                  -> public FLUX.1-dev ONNX vae.opt/
+  transformer.opt/fp4/      -> custom NVFP4 transformer ONNX directory
+    model.onnx
+    model.onnx_data
+```
+
+Build a static B1, 1024x1024 TensorRT plan set:
+
+```bash
+python3 -m benchmarks.flux1_schnell.flux_batch_sweep \
+  --model-name flux-dev \
+  --backend trt \
+  --precision fp4 \
+  --variant eager \
+  --batch-sizes 1 \
+  --onnx-dir /models/FLUX.1-dev-onnx-composed \
+  --engine-root /engines/FLUX.1-dev-fp4-1024 \
+  --output-dir results/flux-dev-build \
+  --build-only
+```
+
+Generate one 28-step image with a caller-provided prompt:
+
+```bash
+python3 -m benchmarks.flux1_schnell.flux_batch_sweep \
+  --model-name flux-dev \
+  --backend trt \
+  --precision fp4 \
+  --variant eager \
+  --batch-sizes 1 \
+  --onnx-dir /models/FLUX.1-dev-onnx-composed \
+  --engine-root /engines/FLUX.1-dev-fp4-1024 \
+  --output-dir results/flux-dev-inference \
+  --steps 28 \
+  --guidance 3.5 \
+  --warmup 0 \
+  --iterations 1 \
+  --batch-semantics images-per-prompt \
+  --seed 42 \
+  --prompt "A small red robot reading a book beneath a cedar tree, cinematic light"
+```
+
+The image is written below `results/flux-dev-inference/images/flux-dev/`, and the JSON under
+`results/flux-dev-inference/runs/flux-dev/` records the resolved transformer ONNX and TensorRT
+plan paths. Use `images-per-prompt` when the exact `--prompt` should be repeated across the batch;
+`request-batch` uses the benchmark's canonical prompt bank.
+
+FLUX.1-dev output is not comparable to the Schnell reference contract because its guidance and
+denoising schedule differ.
 
 See [`INSTALL.md`](INSTALL.md) for the installation and checkpoint setup for every backend.
 

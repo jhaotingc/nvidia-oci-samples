@@ -18,8 +18,12 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
+from benchmarks.flux1_schnell.flux_model_config import (
+    FLUX_MODEL_SPECS,
+    flux_model_spec,
+)
 from benchmarks.flux1_schnell.flux_prompt_bank import prompt_digest, request_prompts
+from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -64,7 +68,8 @@ def load_pytorch(args):
     from flux.modules.conditioner import HFEmbedder
     from flux.util import load_ae, load_flow_model
 
-    os.environ["FLUX_MODEL"] = str(args.native_model_dir / "flux1-schnell.safetensors")
+    model_spec = flux_model_spec(args.model_name)
+    os.environ["FLUX_MODEL"] = str(args.native_model_dir / model_spec.native_checkpoint)
     os.environ["FLUX_AE"] = str(args.native_model_dir / "ae.safetensors")
     for name in ("FLUX_MODEL", "FLUX_AE"):
         if not Path(os.environ[name]).is_file():
@@ -99,15 +104,17 @@ def load_pytorch(args):
     os.chdir(alias_root)
     try:
         t5 = HFEmbedder(
-            "google/t5-v1_1-xxl", max_length=256, torch_dtype=torch.bfloat16
+            "google/t5-v1_1-xxl",
+            max_length=model_spec.t5_max_length,
+            torch_dtype=torch.bfloat16,
         ).to(device)
         clip = HFEmbedder(
             "openai/clip-vit-large-patch14", max_length=77, torch_dtype=torch.bfloat16
         ).to(device)
     finally:
         os.chdir(previous_cwd)
-    model = load_flow_model("flux-schnell", device=device, verbose=False)
-    ae = load_ae("flux-schnell", device=device)
+    model = load_flow_model(args.model_name, device=device, verbose=False)
+    ae = load_ae(args.model_name, device=device)
     if args.variant == "compile":
         model = torch.compile(model, mode="max-autotune-no-cudagraphs")
     return None, t5, clip, model, ae
@@ -131,7 +138,7 @@ def load_tensorrt(args, batch_size: int):
     engine_dir = args.engine_root / f"b{batch_size}"
     engine_dir.mkdir(parents=True, exist_ok=True)
     if not args.build_only:
-        plan_dir = engine_dir / "flux-schnell"
+        plan_dir = engine_dir / args.model_name
         transformer_plans = list(plan_dir.glob(f"transformer_{args.precision}*.plan"))
         if not transformer_plans:
             raise FileNotFoundError(
@@ -144,7 +151,7 @@ def load_tensorrt(args, batch_size: int):
         max_batch=32,
     )
     engines = manager.load_engines(
-        model_name="flux-schnell",
+        model_name=args.model_name,
         module_names={
             ModuleName.CLIP,
             ModuleName.TRANSFORMER,
@@ -175,6 +182,7 @@ def load_tensorrt(args, batch_size: int):
 
 @torch.inference_mode()
 def generate(t5, clip, model, ae, args, batch_size: int, seed: int):
+    model_spec = flux_model_spec(args.model_name)
     device = torch.device("cuda")
     noise = get_noise(
         batch_size,
@@ -190,8 +198,12 @@ def generate(t5, clip, model, ae, args, batch_size: int, seed: int):
         else [args.prompt] * batch_size
     )
     inputs = prepare(t5, clip, noise, prompt=prompts)
-    timesteps = get_schedule(args.steps, inputs["img"].shape[1], shift=False)
-    latents = denoise(model, **inputs, timesteps=timesteps, guidance=0.0)
+    timesteps = get_schedule(
+        args.steps,
+        inputs["img"].shape[1],
+        shift=model_spec.schedule_shift,
+    )
+    latents = denoise(model, **inputs, timesteps=timesteps, guidance=args.guidance)
     latents = unpack(latents.float(), args.height, args.width)
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         return ae.decode(latents)
@@ -204,10 +216,13 @@ def benchmark_batch(args, batch_size: int) -> dict:
         if args.backend == "pytorch":
             raise RuntimeError("PyTorch models must be supplied by the outer sweep")
         manager, t5, clip, model, ae = load_tensorrt(args, batch_size)
-        plans = sorted((args.engine_root / f"b{batch_size}" / "flux-schnell").glob("*.plan"))
+        plans = sorted(
+            (args.engine_root / f"b{batch_size}" / args.model_name).glob("*.plan")
+        )
         if args.build_only:
             return {
                 "status": "built",
+                "model_name": args.model_name,
                 "backend": args.backend,
                 "precision": args.precision,
                 "variant": args.variant,
@@ -225,6 +240,10 @@ def benchmark_batch(args, batch_size: int) -> dict:
 
 
 def run_measurements(args, batch_size: int, t5, clip, model, ae) -> dict:
+    model_spec = flux_model_spec(args.model_name)
+    plan_dir = args.engine_root / f"b{batch_size}" / args.model_name
+    plans = sorted(path for path in plan_dir.glob("*.plan") if path.is_file())
+    transformer_onnx = args.onnx_dir / f"transformer.opt/{args.precision}/model.onnx"
     torch.cuda.synchronize()
     model_memory = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
@@ -263,19 +282,31 @@ def run_measurements(args, batch_size: int, t5, clip, model, ae) -> dict:
         else [args.prompt]
     )
     mean_seconds = statistics.mean(latencies)
-    image_path = args.output_dir / "images" / (
+    image_root = args.output_dir / "images"
+    if args.model_name != "flux-schnell":
+        image_root /= args.model_name
+    image_path = image_root / (
         f"{args.backend}-{args.precision}-{args.variant}-b{batch_size}.png"
     )
     image_stats = save_first_image(output, image_path)
     return {
         "status": "ok",
+        "model_name": args.model_name,
         "backend": args.backend,
         "precision": args.precision,
         "variant": args.variant,
         "batch_size": batch_size,
+        "onnx_dir": str(args.onnx_dir.resolve()),
+        "transformer_onnx": str(transformer_onnx.resolve()),
+        "engine_dir": str(plan_dir.resolve()),
+        "plan_count": len(plans),
+        "plan_bytes": sum(path.stat().st_size for path in plans),
+        "plans": [str(path.resolve()) for path in plans],
         "width": args.width,
         "height": args.height,
         "steps": args.steps,
+        "guidance": args.guidance,
+        "schedule_shift": model_spec.schedule_shift,
         "warmup": args.warmup,
         "iterations": args.iterations,
         "batch_semantics": args.batch_semantics,
@@ -298,7 +329,10 @@ def run_measurements(args, batch_size: int, t5, clip, model, ae) -> dict:
 
 
 def write_result(args, result: dict) -> None:
-    run_dir = args.output_dir / "runs" / f"{args.backend}-{args.precision}-{args.variant}"
+    run_root = args.output_dir / "runs"
+    if args.model_name != "flux-schnell":
+        run_root /= args.model_name
+    run_dir = run_root / f"{args.backend}-{args.precision}-{args.variant}"
     run_dir.mkdir(parents=True, exist_ok=True)
     output = run_dir / f"b{result['batch_size']}.json"
     output.write_text(json.dumps(result, indent=2) + "\n")
@@ -307,13 +341,28 @@ def write_result(args, result: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model-name",
+        choices=tuple(FLUX_MODEL_SPECS),
+        default="flux-schnell",
+        help="FLUX sampling and TensorRT engine namespace",
+    )
     parser.add_argument("--backend", choices=("trt", "pytorch"), required=True)
     parser.add_argument("--precision", choices=("bf16", "fp4"), required=True)
     parser.add_argument("--variant", choices=("eager", "cuda_graph", "compile"), default="eager")
     parser.add_argument("--batch-sizes", type=int, nargs="+", required=True)
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument(
+        "--steps",
+        type=int,
+        help="Denoising steps; defaults to 4 for Schnell and 50 for Dev",
+    )
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        help="Guidance; defaults to 0.0 for Schnell and 3.5 for Dev",
+    )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
@@ -339,6 +388,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    model_spec = flux_model_spec(args.model_name)
+    if args.steps is None:
+        args.steps = model_spec.default_steps
+    if args.guidance is None:
+        args.guidance = model_spec.default_guidance
+
+    if args.steps <= 0:
+        parser.error("--steps must be positive")
+    if args.guidance < 0:
+        parser.error("--guidance must be non-negative")
     if args.backend == "pytorch" and args.precision != "bf16":
         parser.error("The BFL native PyTorch path does not provide NVFP4 weights")
     if args.backend == "pytorch" and args.variant != "compile":
@@ -356,6 +415,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     environment = {
+        "model_name": args.model_name,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(0),
@@ -380,6 +440,7 @@ def main() -> None:
                 had_error = True
                 result = {
                     "status": "error",
+                    "model_name": args.model_name,
                     "backend": args.backend,
                     "precision": args.precision,
                     "variant": args.variant,
@@ -405,6 +466,7 @@ def main() -> None:
             had_error = True
             result = {
                 "status": "error",
+                "model_name": args.model_name,
                 "backend": args.backend,
                 "precision": args.precision,
                 "variant": args.variant,
